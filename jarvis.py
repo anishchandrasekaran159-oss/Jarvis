@@ -2,10 +2,24 @@ import json
 import os
 import requests
 from datetime import datetime
+from dotenv import load_dotenv
+
+# THIS MUST BE FIRST — loads .env before any API client initializes
+load_dotenv()
+
+from google import genai
+from google.genai import types
 
 MEMORY_FILE = "jarvis_memory.json"
 
-# ─── MEMORY FUNCTIONS (from Day 1) ────────────────────────────────────────────
+# Initialize Gemini client — reads GEMINI_API_KEY from .env
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Conversation history — full back-and-forth stored here
+# Sent with every message so JARVIS remembers context
+conversation_history = []
+
+# ─── MEMORY FUNCTIONS (Day 1) ─────────────────────────────────────────────────
 
 def save_memory(data):
     with open(MEMORY_FILE, "w") as f:
@@ -22,53 +36,77 @@ def update_memory(key, value):
     memory[key] = value
     save_memory(memory)
 
-# ─── WEATHER FUNCTION (Day 2 - NEW) ───────────────────────────────────────────
+# ─── WEATHER FUNCTION (Day 2) ─────────────────────────────────────────────────
 
 def get_weather(city="Chennai"):
-    """
-    Hits the wttr.in API and returns current weather for a city.
-    wttr.in is a free weather service - no API key needed.
-    We add ?format=j1 to get JSON instead of the human-readable page.
-    """
     url = f"https://wttr.in/{city}?format=j1"
-    
     try:
-        # requests.get() sends a GET request to the URL
-        # timeout=5 means "give up after 5 seconds" - always set this!
         response = requests.get(url, timeout=5)
-        
-        # response.status_code tells you if it worked
-        # 200 = success, 404 = not found, 500 = server error
         if response.status_code != 200:
-            return f"Couldn't reach weather service. Status: {response.status_code}"
-        
-        # .json() parses the response body from JSON string → Python dict
+            return f"Couldn't reach weather service."
         data = response.json()
-        
-        # Navigate the nested dict to get what we want
-        # This structure comes from wttr.in's API - you learn it by reading their docs
         current = data["current_condition"][0]
-        
         temp_c = current["temp_C"]
         feels_like = current["FeelsLikeC"]
         description = current["weatherDesc"][0]["value"]
         humidity = current["humidity"]
-        
         return (
-            f"Weather in {city}:\n"
-            f"  Condition : {description}\n"
-            f"  Temp      : {temp_c}°C (feels like {feels_like}°C)\n"
-            f"  Humidity  : {humidity}%"
+            f"Weather in {city}: {description}, "
+            f"{temp_c}C (feels like {feels_like}C), "
+            f"Humidity: {humidity}%"
         )
-    
     except requests.exceptions.ConnectionError:
-        return "No internet connection. Can't fetch weather."
+        return "No internet connection."
     except requests.exceptions.Timeout:
-        return "Weather request timed out. Try again."
+        return "Weather request timed out."
     except Exception as e:
-        return f"Something went wrong: {e}"
+        return f"Weather error: {e}"
 
-# ─── BOOT SEQUENCE (from Day 1) ───────────────────────────────────────────────
+# ─── GEMINI BRAIN (Day 3) ─────────────────────────────────────────────────────
+
+from groq import Groq
+
+# Groq client — reads GROQ_API_KEY from .env
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Full conversation history — same pattern as before
+conversation_history = []
+
+def ask_groq(user_message, user_name="there"):
+    # Add user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+
+    # System message + full history sent every time
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"You are JARVIS, a sharp and efficient AI assistant. "
+                f"You are talking to {user_name}. "
+                f"Today's date is {datetime.now().strftime('%B %d, %Y')}. "
+                f"Be concise, helpful, and direct. No fluff. No filler phrases."
+            )
+        }
+    ] + conversation_history
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=1024
+        )
+        reply = response.choices[0].message.content
+        conversation_history.append({
+            "role": "assistant",
+            "content": reply
+        })
+        return reply
+    except Exception as e:
+        return f"Brain error: {e}"
+
+# ─── BOOT SEQUENCE ────────────────────────────────────────────────────────────
 
 def boot_jarvis():
     memory = load_memory()
@@ -85,33 +123,37 @@ def boot_jarvis():
         memory = load_memory()
         print(f"JARVIS: Welcome back, {memory['user']}. Session #{sessions}.")
 
-# ─── COMMAND LOOP (Day 2 - NEW) ───────────────────────────────────────────────
+# ─── COMMAND LOOP ─────────────────────────────────────────────────────────────
 
 def run_jarvis():
     boot_jarvis()
-    print("JARVIS: Type a command. ('weather', 'quit')\n")
-    
+    user_name = load_memory().get("user", "there")
+    print("JARVIS: Online. Ask me anything. ('quit' to exit)\n")
+
     while True:
-        # The loop: listen → understand → act → repeat
-        # This is the core pattern of every AI assistant ever built
-        command = input("You: ").strip().lower()
-        
-        if command == "quit":
-            print("JARVIS: Shutting down. See you next time.")
+        user_input = input("You: ").strip()
+
+        if not user_input:
+            continue
+
+        if user_input.lower() == "quit":
+            print("JARVIS: Shutting down.")
             break
-        
-        elif command == "weather":
-            print("JARVIS: Fetching weather...")
-            result = get_weather("Chennai")
-            print(f"JARVIS: {result}\n")
-        
-        elif command.startswith("weather "):
-            # Lets user say "weather Mumbai" to get another city
-            city = command.split(" ", 1)[1]  # splits "weather Mumbai" → ["weather", "Mumbai"]
-            print(f"JARVIS: Fetching weather for {city}...")
-            result = get_weather(city)
-            print(f"JARVIS: {result}\n")
-        
+
+        # Weather: fetch live data, pass to Gemini to reason about it
+        elif "weather" in user_input.lower():
+            words = user_input.lower().split()
+            city = words[words.index("in") + 1].capitalize() if "in" in words else "Chennai"
+            weather_data = get_weather(city)
+            enriched = f"{user_input}\n\n[Live weather data: {weather_data}]"
+            response = ask_groq(enriched, user_name)
+            print(f"JARVIS: {response}\n")
+
+        # Everything else — straight to Gemini
         else:
-            print(f"JARVIS: I don't know how to '{command}' yet. Coming soon.\n")
+            response = ask_groq(user_input, user_name)
+            print(f"JARVIS: {response}\n")
+
+# ─── RUN ──────────────────────────────────────────────────────────────────────
+
 run_jarvis()
