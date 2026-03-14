@@ -1,10 +1,15 @@
 import json
 import os
 import requests
+import threading
+import speech_recognition as sr
 from datetime import datetime
 from dotenv import load_dotenv
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
 
-# MUST BE FIRST — loads .env before any API client initializes
+# MUST BE FIRST
 load_dotenv()
 
 from groq import Groq
@@ -12,6 +17,10 @@ from groq import Groq
 MEMORY_FILE = "jarvis_memory.json"
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 conversation_history = []
+
+# Initialize recognizer once — reused every listen call
+recognizer = sr.Recognizer()
+
 
 # ─── MEMORY FUNCTIONS ─────────────────────────────────────────────────────────
 
@@ -33,9 +42,7 @@ def update_memory(key, value):
 # ─── KNOWLEDGE FUNCTIONS (Day 4) ──────────────────────────────────────────────
 
 def save_knowledge(fact_key, fact_value):
-    """Save a single fact into the 'knowledge' section of memory."""
     memory = load_memory()
-    # If 'knowledge' dict doesn't exist yet, create it
     if "knowledge" not in memory:
         memory["knowledge"] = {}
     memory["knowledge"][fact_key] = fact_value
@@ -43,55 +50,30 @@ def save_knowledge(fact_key, fact_value):
     return f"Got it. I'll remember that your {fact_key} is '{fact_value}'."
 
 def load_knowledge():
-    """Return the knowledge dict, or empty dict if nothing saved yet."""
     memory = load_memory()
     return memory.get("knowledge", {})
 
 def format_knowledge_for_prompt(knowledge):
-    """
-    Convert the knowledge dict into a readable string for the system prompt.
-    Example: {"city": "Chennai"} → "- city: Chennai"
-    """
     if not knowledge:
         return "None yet."
     return "\n".join(f"- {k}: {v}" for k, v in knowledge.items())
 
 def parse_remember_command(user_input):
-    """
-    Parse 'remember X is Y' or 'remember my X is Y' style commands.
-    Returns (key, value) tuple or (None, None) if pattern not matched.
-    
-    Examples:
-      'remember my city is Chennai'     → ('city', 'Chennai')
-      'remember my goal is build JARVIS' → ('goal', 'build JARVIS')
-      'remember hates is mornings'      → ('hates', 'mornings')
-    """
     text = user_input.strip()
-    
-    # Remove the 'remember' prefix (case-insensitive)
     if text.lower().startswith("remember my "):
         text = text[len("remember my "):]
     elif text.lower().startswith("remember "):
         text = text[len("remember "):]
     else:
         return None, None
-
-    # Now text should be like "city is Chennai" or "goal is build JARVIS"
     if " is " in text:
-        parts = text.split(" is ", 1)  # split on first 'is' only
+        parts = text.split(" is ", 1)
         key = parts[0].strip().lower().replace(" ", "_")
         value = parts[1].strip()
         return key, value
-    
     return None, None
 
 def auto_extract_knowledge(user_message, assistant_reply):
-    """
-    Ask Groq to check if the conversation revealed any facts worth remembering.
-    Returns a dict of {key: value} facts, or empty dict if nothing found.
-    
-    This is the 'smart' path — JARVIS notices facts even if you don't use 'remember'.
-    """
     extraction_prompt = f"""
 You are a fact extractor. Given a user message and assistant reply, extract any personal facts about the user worth saving long-term.
 
@@ -102,9 +84,7 @@ Extract facts like: name, city, job, age, goal, hobby, preference, friend names,
 Only extract facts explicitly stated by the USER (not assumptions).
 If no clear facts are stated, return empty JSON.
 
-Respond ONLY with a valid JSON object. No explanation. No markdown. Examples:
-{{"city": "Chennai", "hobby": "coding"}}
-{{}}
+Respond ONLY with a valid JSON object. No explanation. No markdown.
 """
     try:
         response = groq_client.chat.completions.create(
@@ -116,9 +96,65 @@ Respond ONLY with a valid JSON object. No explanation. No markdown. Examples:
         facts = json.loads(raw)
         return facts if isinstance(facts, dict) else {}
     except Exception:
-        # If extraction fails or JSON is invalid, silently skip — don't crash JARVIS
         return {}
 
+# ─── VOICE INPUT (Day 5) ──────────────────────────────────────────────────────
+
+
+
+SAMPLE_RATE = 16000   # Whisper expects 16kHz audio
+CHANNELS = 1          # Mono — one microphone
+TEMP_AUDIO_FILE = "temp_audio.wav"
+
+import keyboard
+
+def listen():
+    """
+    Push-to-talk: hold SPACEBAR to record, release to send to Whisper.
+    No silence detection needed — you control start and stop.
+    """
+    print("JARVIS: Hold SPACEBAR to speak, release when done...")
+
+    # Wait until spacebar is pressed
+    keyboard.wait("space", suppress=True)
+    print("JARVIS: Recording... (release SPACEBAR to stop)")
+
+    recorded_chunks = []
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32') as stream:
+        while keyboard.is_pressed("space"):
+            chunk, _ = stream.read(int(SAMPLE_RATE * 0.1))  # 100ms chunks
+            recorded_chunks.append(chunk)
+
+    if not recorded_chunks:
+        print("JARVIS: Nothing recorded.")
+        return None
+
+    print("JARVIS: Processing...")
+
+    # Combine and save
+    audio_data = np.concatenate(recorded_chunks, axis=0)
+    sf.write(TEMP_AUDIO_FILE, audio_data, SAMPLE_RATE)
+
+    # Send to Groq Whisper
+    try:
+        with open(TEMP_AUDIO_FILE, "rb") as audio_file:
+            transcription = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=audio_file,
+                response_format="text"
+            )
+        os.remove(TEMP_AUDIO_FILE)
+        text = transcription.strip()
+        if text:
+            print(f"You (voice): {text}")
+            return text
+        else:
+            print("JARVIS: Caught silence. Try again.")
+            return None
+    except Exception as e:
+        print(f"JARVIS: Voice error: {e}")
+        return None
 # ─── WEATHER FUNCTION (Day 2) ─────────────────────────────────────────────────
 
 def get_weather(city="Chennai"):
@@ -126,7 +162,7 @@ def get_weather(city="Chennai"):
     try:
         response = requests.get(url, timeout=5)
         if response.status_code != 200:
-            return f"Couldn't reach weather service."
+            return "Couldn't reach weather service."
         data = response.json()
         current = data["current_condition"][0]
         temp_c = current["temp_C"]
@@ -145,12 +181,11 @@ def get_weather(city="Chennai"):
     except Exception as e:
         return f"Weather error: {e}"
 
-# ─── GROQ BRAIN (Day 3 + upgraded) ───────────────────────────────────────────
+# ─── GROQ BRAIN ───────────────────────────────────────────────────────────────
 
 def ask_groq(user_message, user_name="there"):
     conversation_history.append({"role": "user", "content": user_message})
 
-    # Load what JARVIS knows about the user and inject into system prompt
     knowledge = load_knowledge()
     knowledge_text = format_knowledge_for_prompt(knowledge)
 
@@ -169,21 +204,42 @@ def ask_groq(user_message, user_name="there"):
     ] + conversation_history
 
     try:
-        response = groq_client.chat.completions.create(
+        # stream=True — Groq sends tokens as they're generated
+        # instead of waiting for the full reply to be ready
+        stream = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
-            max_tokens=1024
+            max_tokens=1024,
+            stream=True
         )
-        reply = response.choices[0].message.content
-        conversation_history.append({"role": "assistant", "content": reply})
 
-        # Auto-extract any facts from this exchange and save them silently
-        facts = auto_extract_knowledge(user_message, reply)
-        for key, value in facts.items():
-            save_knowledge(key, value)
+        # Print "JARVIS: " once, then stream words as they arrive
+        print("JARVIS: ", end="", flush=True)
+        full_reply = ""
 
-        return reply
+        for chunk in stream:
+            # Each chunk has a delta — the next piece of text
+            delta = chunk.choices[0].delta.content
+            if delta:
+                print(delta, end="", flush=True)
+                full_reply += delta
+
+        print("\n")  # newline after reply finishes
+
+        conversation_history.append({"role": "assistant", "content": full_reply})
+
+        # Background fact extraction — doesn't block the response
+        def extract_and_save():
+            facts = auto_extract_knowledge(user_message, full_reply)
+            for key, value in facts.items():
+                save_knowledge(key, value)
+
+        threading.Thread(target=extract_and_save, daemon=True).start()
+
+        return full_reply
+
     except Exception as e:
+        print()
         return f"Brain error: {e}"
 
 # ─── BOOT SEQUENCE ────────────────────────────────────────────────────────────
@@ -203,7 +259,6 @@ def boot_jarvis():
         memory = load_memory()
         print(f"JARVIS: Welcome back, {memory['user']}. Session #{sessions}.")
 
-    # Show JARVIS what it already knows
     knowledge = load_knowledge()
     if knowledge:
         print(f"JARVIS: I remember {len(knowledge)} things about you.")
@@ -213,20 +268,34 @@ def boot_jarvis():
 def run_jarvis():
     boot_jarvis()
     user_name = load_memory().get("user", "there")
-    print("JARVIS: Online. ('quit' to exit, 'remember X is Y' to save facts, 'what do you know' to review)\n")
+
+    mode = input("JARVIS: Input mode — type 'v' for voice, anything else for text: ").strip().lower()
+    use_voice = mode == "v"
+
+    # Calibrate mic once at boot — not on every listen call
+   
+
+    print("JARVIS: Online. ('quit' to exit, 'remember my X is Y' to save facts, 'what do you know' to review)\n")
 
     while True:
-        user_input = input("You: ").strip()
+        if use_voice:
+            user_input = listen()
+            if user_input is None:
+                continue
+        else:
+            user_input = input("You: ").strip()
 
         if not user_input:
             continue
 
-        if user_input.lower() == "quit":
+        # Strip trailing punctuation before any comparison — speech recognition adds it
+        cleaned = user_input.lower().strip().rstrip(".!?,")
+
+        if cleaned == "quit":
             print("JARVIS: Shutting down.")
             break
 
-        # Explicit remember command
-        elif user_input.lower().startswith("remember"):
+        elif cleaned.startswith("remember"):
             key, value = parse_remember_command(user_input)
             if key and value:
                 result = save_knowledge(key, value)
@@ -234,30 +303,27 @@ def run_jarvis():
             else:
                 print("JARVIS: Try: 'remember my [thing] is [value]'\n")
 
-        # Review what JARVIS knows
-        elif "what do you know" in user_input.lower():
+        elif "what do you know" in cleaned:
             knowledge = load_knowledge()
             if not knowledge:
-                print("JARVIS: Nothing saved yet. Tell me things using 'remember my X is Y'.\n")
+                print("JARVIS: Nothing saved yet.\n")
             else:
                 print("JARVIS: Here's what I know about you:")
                 for k, v in knowledge.items():
                     print(f"  - {k}: {v}")
                 print()
 
-        # Weather command
-        elif "weather" in user_input.lower():
-            words = user_input.lower().split()
+        elif "weather" in cleaned:
+            words = cleaned.split()
             city = words[words.index("in") + 1].capitalize() if "in" in words else "Chennai"
             weather_data = get_weather(city)
             enriched = f"{user_input}\n\n[Live weather data: {weather_data}]"
             response = ask_groq(enriched, user_name)
-            print(f"JARVIS: {response}\n")
 
-        # Everything else — AI brain
+
         else:
             response = ask_groq(user_input, user_name)
-            print(f"JARVIS: {response}\n")
+
 
 # ─── RUN ──────────────────────────────────────────────────────────────────────
 
