@@ -1,5 +1,10 @@
 {
   "user": "Anish",
-  "sessions": 31,
-  "last_seen": "2026-03-13 16:48:02"
+  "sessions": 35,
+  "last_seen": "2026-03-14 12:46:04",
+  "knowledge": {
+    "favourite_cricketer": "dhoni",
+    "name": "Anish",
+    "preference": "using Claude for projects"
+  }
 }
