@@ -1,12 +1,6 @@
 {
   "number_of_apps_open": 5,
-  "open_apps": [
-    "browser",
-    "email",
-    "chat",
-    "music",
-    "notes"
-  ],
+  "open_apps": 5,
   "username": "Anish",
   "number_of_open_apps": 5,
   "openApps": [
@@ -16,5 +10,15 @@
     "music",
     "notes"
   ],
-  "numberOfOpenApps": 5
+  "numberOfOpenApps": 5,
+  "music_preference": "heavy playlist with low bass",
+  "bass_preference": "low",
+  "app_names": [
+    "browser",
+    "email",
+    "chat",
+    "music",
+    "notes"
+  ],
+  "session_count": 5
 }

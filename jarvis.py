@@ -1,15 +1,17 @@
 import os
 import io
 import json
+import time
+import glob
+import struct
 import threading
 import subprocess
+import winreg
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
-import keyboard
 import pygame
 import pvporcupine
-import struct
 import pyaudio
 from datetime import datetime
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ from elevenlabs.client import ElevenLabs
 
 load_dotenv()
 
-# ── CLIENTS ──────────────────────────────────────────────────────────────────
+# ── CLIENTS ───────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 eleven_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 porcupine = pvporcupine.create(
@@ -26,43 +28,26 @@ porcupine = pvporcupine.create(
     keywords=["jarvis"]
 )
 
-# ── CONSTANTS ────────────────────────────────────────────────────────────────
+# ── CONSTANTS ─────────────────────────────────────────────────────────────────
 MEMORY_FILE = "jarvis_memory.json"
 KNOWLEDGE_FILE = "jarvis_knowledge.json"
 TEMP_AUDIO = "temp_audio.wav"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
-
-# Replace with your actual Windows username
 USERNAME = os.getenv("USERNAME") or "YourUsername"
 
-# ── APP REGISTRY ─────────────────────────────────────────────────────────────
-APP_REGISTRY = {
-    # Browsers
-    "chrome":       r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "firefox":      r"C:\Program Files\Mozilla Firefox\firefox.exe",
-    "edge":         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+# Silence detection — calibrate() will overwrite SILENCE_THRESHOLD at boot
+SILENCE_THRESHOLD = 0.01
+SILENCE_DURATION = 2.5   # seconds of silence before stopping recording
+MAX_DURATION = 15        # hard cap on recording length
+END_COMMANDS = ["do it", "do it now", "that's all", "execute", "over"]
 
-    # Dev tools
-    "vscode":       rf"C:\Users\{USERNAME}\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-    "vs code":      rf"C:\Users\{USERNAME}\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-    "code":         rf"C:\Users\{USERNAME}\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-
-    # Media / productivity
-    "spotify":      rf"C:\Users\{USERNAME}\AppData\Roaming\Spotify\Spotify.exe",
-    "notepad":      "notepad.exe",
-    "calculator":   "calc.exe",
-    "explorer":     "explorer.exe",
-    "task manager": "taskmgr.exe",
-}
-
-# ── SESSION STATE ────────────────────────────────────────────────────────────
-# This holds the conversation history for the current session.
-# It grows with every message so Groq has context across the whole conversation.
+# ── SESSION STATE ─────────────────────────────────────────────────────────────
 conversation_history = []
+_APP_CACHE: dict[str, str] = {}
 
-# ── MEMORY ───────────────────────────────────────────────────────────────────
+# ── MEMORY ────────────────────────────────────────────────────────────────────
 def save_memory(data):
     with open(MEMORY_FILE, "w") as f:
         json.dump(data, f, indent=2)
@@ -90,7 +75,7 @@ def save_knowledge(data):
         json.dump(data, f, indent=2)
 
 def extract_and_save(text):
-    """Runs in background thread — extracts facts from JARVIS's reply and stores them."""
+    """Background thread — extracts facts from JARVIS reply and stores them."""
     knowledge = load_knowledge()
     prompt = f"""Extract any specific facts, preferences, or information about the user from this text.
 Return ONLY a JSON object with key-value pairs. If nothing useful, return {{}}.
@@ -106,58 +91,28 @@ Text: {text}"""
         knowledge.update(new_facts)
         save_knowledge(knowledge)
     except Exception:
-        pass  # Silent fail — background task, don't interrupt user
+        pass
 
-# ── TOOLS ────────────────────────────────────────────────────────────────────
-import os
-import subprocess
-import glob
-import winreg  # built-in on Windows, no install needed
-
-# ── AUTO APP DISCOVERY ────────────────────────────────────────────────────────
-
+# ── APP DISCOVERY ─────────────────────────────────────────────────────────────
 def get_start_menu_apps() -> dict[str, str]:
-    """
-    Scans Windows Start Menu folders for .lnk shortcut files.
-    Returns a dict of {app_name_lowercase: full_shortcut_path}
-    
-    Why Start Menu? Because every properly installed app creates a shortcut here.
-    It's the same source Windows Search uses when you press the Windows key.
-    """
     apps = {}
-
-    # Two Start Menu locations: system-wide and current user
     start_menu_paths = [
         r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs",
         os.path.expanduser(r"~\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
     ]
-
     for base_path in start_menu_paths:
-        # ** means recursive — finds .lnk files in subfolders too
         pattern = os.path.join(base_path, "**", "*.lnk")
         for shortcut_path in glob.glob(pattern, recursive=True):
-            # Get just the filename without extension = the app name
             app_name = os.path.splitext(os.path.basename(shortcut_path))[0].lower()
             apps[app_name] = shortcut_path
-
     return apps
 
-
 def get_registry_apps() -> dict[str, str]:
-    """
-    Reads the Windows Registry uninstall keys to find installed apps and their paths.
-    Returns a dict of {app_name_lowercase: exe_path}
-    
-    Why Registry? It's the authoritative source — every MSI/installer writes here.
-    """
     apps = {}
-
-    # These two registry paths contain all installed apps
     reg_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",  # 32-bit apps on 64-bit Windows
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
     ]
-
     for reg_path in reg_paths:
         try:
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
@@ -165,95 +120,52 @@ def get_registry_apps() -> dict[str, str]:
                 try:
                     subkey_name = winreg.EnumKey(key, i)
                     subkey = winreg.OpenKey(key, subkey_name)
-
-                    # Every app entry has a DisplayName and optionally InstallLocation
                     try:
                         name = winreg.QueryValueEx(subkey, "DisplayName")[0].lower()
                         location = winreg.QueryValueEx(subkey, "InstallLocation")[0]
                         if location and os.path.isdir(location):
                             apps[name] = location
                     except FileNotFoundError:
-                        pass  # Key doesn't have these fields, skip it
+                        pass
                 except Exception:
                     continue
         except Exception:
             continue
-
     return apps
 
-
-# Build the app cache once at boot — scanning every time would be slow
-_APP_CACHE: dict[str, str] = {}
-
 def build_app_cache():
-    """
-    Called once at JARVIS boot. Builds a combined registry of all installed apps.
-    Merges Start Menu shortcuts + Registry entries into one lookup dict.
-    """
     global _APP_CACHE
     print("JARVIS: Scanning installed apps...")
     _APP_CACHE = {**get_registry_apps(), **get_start_menu_apps()}
     print(f"JARVIS: Found {len(_APP_CACHE)} apps.")
 
-
-# ── SMART OPEN APP ────────────────────────────────────────────────────────────
-
+# ── TOOLS ─────────────────────────────────────────────────────────────────────
 def find_best_match(query: str) -> tuple[str, str] | None:
-    """
-    Fuzzy-matches the user's query against the app cache.
-    Returns (matched_name, path) or None if no match found.
-    
-    Strategy:
-    1. Exact match first
-    2. If no exact match, find all apps whose name CONTAINS the query
-    3. Pick the shortest match (most specific) — "spotify" over "spotify installer"
-    """
     query = query.strip().lower()
-
-    # 1. Exact match
     if query in _APP_CACHE:
         return query, _APP_CACHE[query]
-
-    # 2. Substring match — find everything that contains the query
     matches = [(name, path) for name, path in _APP_CACHE.items() if query in name]
-
     if not matches:
         return None
-
-    # 3. Pick shortest name = most relevant (avoids "uninstall spotify" over "spotify")
-    best = min(matches, key=lambda x: len(x[0]))
-    return best
-
+    return min(matches, key=lambda x: len(x[0]))
 
 def open_app(app_name: str) -> str:
-    """
-    Opens an app by name using auto-discovered paths.
-    Falls back to manual registry if auto-discovery fails.
-    """
     match = find_best_match(app_name)
-
     if not match:
-        return f"I couldn't find '{app_name}' in your installed apps. Try a different name."
-
+        return f"I couldn't find '{app_name}' in your installed apps."
     matched_name, path = match
-
     try:
-        # .lnk shortcut files need shell=True to resolve properly
-        # Direct .exe files work with shell=False
         if path.endswith(".lnk"):
-            os.startfile(path)  # os.startfile handles .lnk resolution natively
+            os.startfile(path)
         else:
             subprocess.Popen(path, shell=False)
-
         return f"Opening {matched_name}."
-
     except FileNotFoundError:
-        return f"Found '{matched_name}' in the registry but couldn't locate the file. It may have been moved."
+        return f"Couldn't locate {matched_name}. It may have been moved or uninstalled."
     except Exception as e:
         return f"Something went wrong opening '{matched_name}': {e}"
 
 def get_weather(city="Chennai") -> str:
-    """Fetches weather for a city using wttr.in."""
     import requests
     url = f"https://wttr.in/{city}?format=j1"
     try:
@@ -274,14 +186,8 @@ def get_weather(city="Chennai") -> str:
     except Exception as e:
         return f"Couldn't get weather: {e}"
 
-# ── INTENT DETECTION ─────────────────────────────────────────────────────────
+# ── INTENT DETECTION ──────────────────────────────────────────────────────────
 def detect_intent(command: str) -> tuple[str, str]:
-    """
-    Uses Groq to classify what the user wants and extract the key parameter.
-    Returns (intent, parameter).
-    
-    Intents: open_app | get_weather | general
-    """
     prompt = f"""Classify this command into one intent. Reply ONLY with JSON, no extra text.
 
 Command: "{command}"
@@ -292,7 +198,6 @@ Intents:
 - general: anything else. Parameter is empty string.
 
 Reply format: {{"intent": "...", "parameter": "..."}}"""
-
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -305,17 +210,9 @@ Reply format: {{"intent": "...", "parameter": "..."}}"""
     except Exception:
         return "general", ""
 
-# ── GROQ BRAIN ───────────────────────────────────────────────────────────────
+# ── GROQ BRAIN ────────────────────────────────────────────────────────────────
 def ask_groq(user_input: str) -> str:
-    """
-    Sends the user's message to Groq with full conversation history.
-    Streams the response token by token.
-    Saves facts in the background.
-    Returns the full reply.
-    """
     global conversation_history
-
-    # Build system prompt with long-term knowledge injected
     knowledge = load_knowledge()
     memory = load_memory()
     knowledge_str = json.dumps(knowledge, indent=2) if knowledge else "None yet."
@@ -329,12 +226,9 @@ Long-term knowledge about the user: {knowledge_str}
 
 Use this knowledge naturally in responses when relevant."""
 
-    # Add user message to history
     conversation_history.append({"role": "user", "content": user_input})
-
     messages = [{"role": "system", "content": system_prompt}] + conversation_history
 
-    # Stream response
     stream = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
@@ -351,21 +245,17 @@ Use this knowledge naturally in responses when relevant."""
             full_reply += delta
     print("\n")
 
-    # Add reply to history (rolling context)
     conversation_history.append({"role": "assistant", "content": full_reply})
 
-    # Keep history from growing too large (last 20 messages = 10 exchanges)
+    # Cap history at 20 messages (10 exchanges)
     if len(conversation_history) > 20:
         conversation_history = conversation_history[-20:]
 
-    # Extract and save facts in background — user never waits for this
     threading.Thread(target=extract_and_save, args=(full_reply,), daemon=True).start()
-
     return full_reply
 
-# ── VOICE OUTPUT ─────────────────────────────────────────────────────────────
+# ── VOICE OUTPUT ──────────────────────────────────────────────────────────────
 def speak(text: str):
-    """Converts text to speech using ElevenLabs and plays it via pygame."""
     try:
         audio_generator = eleven_client.text_to_speech.convert(
             voice_id=VOICE_ID,
@@ -382,18 +272,70 @@ def speak(text: str):
     except Exception as e:
         print(f"[Voice output error: {e}]")
 
+# ── MIC CALIBRATION ───────────────────────────────────────────────────────────
+def get_rms(chunk: np.ndarray) -> float:
+    """Measures loudness of an audio chunk using Root Mean Square."""
+    return float(np.sqrt(np.mean(chunk ** 2)))
+
+def calibrate():
+    """
+    Records 2 seconds of ambient silence at boot.
+    Sets SILENCE_THRESHOLD to 2x ambient noise — anything above this is speech.
+    """
+    global SILENCE_THRESHOLD
+    print("JARVIS: Calibrating mic... stay silent for 2 seconds.")
+    chunks = []
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
+        for _ in range(20):  # 20 x 100ms = 2 seconds
+            chunk, _ = stream.read(int(SAMPLE_RATE * 0.1))
+            chunks.append(get_rms(chunk))
+    ambient = float(np.mean(chunks))
+    SILENCE_THRESHOLD = ambient * 2
+    print(f"JARVIS: Calibrated. Ambient = {ambient:.4f}, threshold = {SILENCE_THRESHOLD:.4f}")
+
 # ── VOICE INPUT ───────────────────────────────────────────────────────────────
-def listen() -> str:
-    """Push-to-talk: hold SPACEBAR to record, release to transcribe via Groq Whisper."""
-    print("JARVIS: Hold SPACEBAR to speak...")
-    keyboard.wait("space", suppress=True)
-    print("JARVIS: Recording... (release SPACEBAR to stop)")
+def listen() -> str | None:
+    """
+    Listens after wake word detection.
+    Starts recording, waits for speech, stops after SILENCE_DURATION seconds of silence.
+    Transcribes via Groq Whisper.
+    """
+    print("JARVIS: Listening...")
 
     recorded_chunks = []
+    silence_start = None
+    speech_detected = False  # don't start silence timer until speech is detected
+    recording_start = time.time()
+
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
-        while keyboard.is_pressed("space"):
+        time.sleep(0.8)  # grace period — gives you time to start speaking
+
+        while True:
             chunk, _ = stream.read(int(SAMPLE_RATE * 0.1))
             recorded_chunks.append(chunk)
+
+            rms = get_rms(chunk)
+            elapsed = time.time() - recording_start
+
+            if elapsed > MAX_DURATION:
+                print("JARVIS: Max duration reached, processing...")
+                break
+
+            if rms >= SILENCE_THRESHOLD:
+                # Speech detected — reset silence timer
+                speech_detected = True
+                silence_start = None
+            else:
+                # Silence — only count down AFTER speech has been detected
+                if speech_detected:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start >= SILENCE_DURATION:
+                        print("JARVIS: Got it, processing...")
+                        break
+
+    if not recorded_chunks:
+        return None
 
     audio_data = np.concatenate(recorded_chunks, axis=0)
     sf.write(TEMP_AUDIO, audio_data, SAMPLE_RATE)
@@ -405,11 +347,23 @@ def listen() -> str:
             response_format="text",
         )
     os.remove(TEMP_AUDIO)
-    return transcription.strip()
+
+    text = transcription.strip()
+    if not text:
+        return None
+
+    # Strip end commands if present — "open chrome do it now" → "open chrome"
+    text_lower = text.lower()
+    for end_cmd in END_COMMANDS:
+        if text_lower.endswith(end_cmd):
+            text = text[:text_lower.rfind(end_cmd)].strip()
+            break
+
+    return text if text else None
 
 # ── WAKE WORD ─────────────────────────────────────────────────────────────────
 def wait_for_wake_word():
-    """Listens continuously via PyAudio until 'Hey JARVIS' is detected."""
+    """Listens continuously via PyAudio until 'JARVIS' is detected."""
     pa = pyaudio.PyAudio()
     audio_stream = pa.open(
         rate=porcupine.sample_rate,
@@ -418,7 +372,7 @@ def wait_for_wake_word():
         input=True,
         frames_per_buffer=porcupine.frame_length,
     )
-    print("JARVIS: Listening for wake word... (say 'Hey JARVIS')")
+    print("JARVIS: Waiting for wake word...")
     try:
         while True:
             pcm = audio_stream.read(porcupine.frame_length, exception_on_overflow=False)
@@ -434,8 +388,10 @@ def wait_for_wake_word():
 
 # ── BOOT ──────────────────────────────────────────────────────────────────────
 def boot_jarvis():
+    """Scans apps, calibrates mic, greets user."""
     build_app_cache()
-    """Handles first-time setup and returning user greeting."""
+    calibrate()
+
     memory = load_memory()
     if "user" not in memory:
         name = input("JARVIS: I don't know you yet. What's your name? → ")
@@ -451,11 +407,8 @@ def boot_jarvis():
         print(f"JARVIS: Welcome back, {memory['user']}. Session #{sessions}.")
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
-# Replace your main loop with this:
-
 def run_jarvis():
     boot_jarvis()
-    build_app_cache()
 
     voice_input = input("JARVIS: Voice input mode? (y/n) → ").strip().lower() == "y"
     voice_output = input("JARVIS: Enable voice output? (y/n) → ").strip().lower() == "y"
@@ -463,15 +416,19 @@ def run_jarvis():
 
     print("\nJARVIS: Online. Ready.\n")
 
-    running = True  # ← shutdown flag
+    running = True
 
     while running:
         try:
             if wake_word:
                 wait_for_wake_word()
+                speak("Yes?")
 
             if voice_input:
                 command = listen()
+                if not command:
+                    print("JARVIS: Didn't catch that.")
+                    continue
                 print(f"You: {command}")
             else:
                 command = input("You: ").strip()
@@ -484,7 +441,7 @@ def run_jarvis():
                 print(f"JARVIS: {farewell}")
                 if voice_output:
                     speak(farewell)
-                running = False  # ← flip the flag, loop exits cleanly
+                running = False
                 break
 
             intent, parameter = detect_intent(command)
@@ -511,8 +468,9 @@ def run_jarvis():
             running = False
             break
 
-    porcupine.delete()  # cleanup porcupine resources
+    porcupine.delete()
     print("JARVIS: Terminated.")
+
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run_jarvis()
