@@ -1,12 +1,12 @@
+import pyaudio
 import sounddevice as sd
-import soundfile as sf
-import numpy as np
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
+print("=== PyAudio device 1 info ===")
+pa = pyaudio.PyAudio()
+info = pa.get_device_info_by_index(1)
+print(f"Default sample rate: {info['defaultSampleRate']}")
+print(f"Max input channels: {info['maxInputChannels']}")
+pa.terminate()
 
-print("Recording for 5 seconds... speak now")
-audio = sd.rec(int(5 * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='float32')
-sd.wait()
-sf.write("mic_test.wav", audio, SAMPLE_RATE)
-print("Saved to mic_test.wav")
+print("\n=== Sounddevice device 1 info ===")
+print(sd.query_devices(1))

@@ -75,11 +75,29 @@ def save_knowledge(data):
         json.dump(data, f, indent=2)
 
 def extract_and_save(text):
-    """Background thread — extracts facts from JARVIS reply and stores them."""
+    """Background thread — extracts real facts from user's own words."""
     knowledge = load_knowledge()
-    prompt = f"""Extract any specific facts, preferences, or information about the user from this text.
-Return ONLY a JSON object with key-value pairs. If nothing useful, return {{}}.
-Text: {text}"""
+    prompt = f"""Extract specific, verifiable facts about the user from what THEY said.
+
+Rules:
+- Only extract things the user explicitly stated about themselves
+- Do NOT infer, assume, or guess anything
+- Do NOT extract questions, commands, or things the user asked about
+- If there are no clear facts about the user, return {{}}
+
+Examples of valid extractions:
+- "I love playing chess" → {{"hobby": "chess"}}
+- "I'm from Chennai" → {{"city": "Chennai"}}
+- "My favourite cricketer is Dhoni" → {{"favourite_cricketer": "MS Dhoni"}}
+
+Examples of invalid extractions (do NOT save these):
+- "What's the weather?" → {{}} (a question, not a fact)
+- "Open Chrome" → {{}} (a command, not a fact)
+- "Tell me something you remember" → {{}} (a question)
+
+User said: "{text}"
+
+Reply ONLY with a JSON object. Nothing else."""
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -87,12 +105,17 @@ Text: {text}"""
             max_tokens=200,
         )
         raw = response.choices[0].message.content.strip()
-        new_facts = json.loads(raw)
-        knowledge.update(new_facts)
-        save_knowledge(knowledge)
+        # Strip markdown fences if model wraps in ```json
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        new_facts = json.loads(raw.strip())
+        if new_facts:  # only save if there's actually something real
+            knowledge.update(new_facts)
+            save_knowledge(knowledge)
     except Exception:
         pass
-
 # ── APP DISCOVERY ─────────────────────────────────────────────────────────────
 def get_start_menu_apps() -> dict[str, str]:
     apps = {}
@@ -186,6 +209,35 @@ def get_weather(city="Chennai") -> str:
     except Exception as e:
         return f"Couldn't get weather: {e}"
 
+# ── WEB SEARCH ────────────────────────────────────────────────────────────────
+def web_search(query: str, original_command: str = None) -> str:
+    """
+    Fetches DuckDuckGo results and routes them through ask_groq so JARVIS
+    delivers the answer in its own voice — not as a generic search summary.
+    """
+    from ddgs import DDGS
+
+    # Step 1 — fetch top 4 results
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=4))
+    except Exception as e:
+        return f"Search failed: {e}"
+
+    if not results:
+        return "Nothing came up for that."
+
+    # Step 2 — format into a context block
+    context = ""
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "")
+        body  = r.get("body", "")
+        context += f"[{i}] {title}\n{body}\n\n"
+
+    # Step 3 — pass to ask_groq so JARVIS answers in character
+    user_question = original_command or query
+    return ask_groq(user_question, tool_context=f"Web search results for '{query}':\n{context}")
+
 # ── INTENT DETECTION ──────────────────────────────────────────────────────────
 def detect_intent(command: str) -> tuple[str, str]:
     prompt = f"""Classify this command into one intent. Reply ONLY with JSON, no extra text.
@@ -195,7 +247,8 @@ Command: "{command}"
 Intents:
 - open_app: user wants to open an application. Extract the app name.
 - get_weather: user wants weather info. Extract the city (default: Chennai).
-- general: anything else. Parameter is empty string.
+- web_search: user wants to search the web, asks about current events, news, facts, prices, scores, or anything that requires up-to-date information. Extract a clean search query.
+- general: conversational, personal, or anything that doesn't need a web search. Parameter is empty string.
 
 Reply format: {{"intent": "...", "parameter": "..."}}"""
     try:
@@ -211,20 +264,40 @@ Reply format: {{"intent": "...", "parameter": "..."}}"""
         return "general", ""
 
 # ── GROQ BRAIN ────────────────────────────────────────────────────────────────
-def ask_groq(user_input: str) -> str:
+def ask_groq(user_input: str, tool_context: str = None) -> str:
+    """
+    Core brain. Always speaks as JARVIS.
+    tool_context: optional raw data from a tool (weather, search, app result).
+    When provided, JARVIS uses it to answer but still sounds like itself.
+    """
     global conversation_history
     knowledge = load_knowledge()
     memory = load_memory()
     knowledge_str = json.dumps(knowledge, indent=2) if knowledge else "None yet."
     memory_str = f"User's name: {memory.get('user', 'Unknown')}. Sessions: {memory.get('sessions', 1)}."
 
+    # Inject tool data into system prompt only when a tool was used
+    tool_section = ""
+    if tool_context:
+        tool_section = f"""
+TOOL DATA — use this to answer the user. Do NOT say "according to my data" or "the results show".
+Just answer naturally, like a person who already knows this information:
+{tool_context}
+"""
+
     system_prompt = f"""You are JARVIS, a personal AI assistant — intelligent, sharp, and concise.
-You speak in short, direct sentences. No fluff.
+You speak in short, direct sentences. No fluff. Sound like a person, not a bot.
+Never announce what you're doing. Never narrate your process.
+Just answer — the way a sharp assistant would in conversation.
 
 User profile: {memory_str}
 Long-term knowledge about the user: {knowledge_str}
-
-Use this knowledge naturally in responses when relevant."""
+{tool_section}
+STRICT RULES:
+- You ONLY know what is explicitly stated in the user profile, knowledge, and tool data above.
+- You have ZERO access to the user's computer unless they tell you something directly.
+- If asked what you remember, only repeat facts from the knowledge above. If nothing relevant, say "I don't have anything stored about that yet."
+- NEVER invent, assume, or fabricate context. Ever."""
 
     conversation_history.append({"role": "user", "content": user_input})
     messages = [{"role": "system", "content": system_prompt}] + conversation_history
@@ -251,7 +324,7 @@ Use this knowledge naturally in responses when relevant."""
     if len(conversation_history) > 20:
         conversation_history = conversation_history[-20:]
 
-    threading.Thread(target=extract_and_save, args=(full_reply,), daemon=True).start()
+    threading.Thread(target=extract_and_save, args=(user_input,), daemon=True).start()
     return full_reply
 
 # ── VOICE OUTPUT ──────────────────────────────────────────────────────────────
@@ -345,6 +418,7 @@ def listen() -> str | None:
             model="whisper-large-v3-turbo",
             file=audio_file,
             response_format="text",
+            prompt="JARVIS. Anish. Chennai. India.",  # biases Whisper vocabulary toward Indian names
         )
     os.remove(TEMP_AUDIO)
 
@@ -447,16 +521,24 @@ def run_jarvis():
             intent, parameter = detect_intent(command)
 
             if intent == "open_app":
-                result = open_app(parameter)
-                print(f"JARVIS: {result}")
+                # Get the raw result, then let JARVIS respond naturally
+                tool_data = open_app(parameter)
+                reply = ask_groq(command, tool_context=f"App launch result: {tool_data}")
                 if voice_output:
-                    speak(result)
+                    speak(reply)
 
             elif intent == "get_weather":
-                result = get_weather(parameter or "Chennai")
-                print(f"JARVIS: {result}")
+                # Fetch weather data, pass it to JARVIS to deliver conversationally
+                tool_data = get_weather(parameter or "Chennai")
+                reply = ask_groq(command, tool_context=f"Current weather data: {tool_data}")
                 if voice_output:
-                    speak(result)
+                    speak(reply)
+
+            elif intent == "web_search":
+                # Pass both the search query and original command so JARVIS answers naturally
+                reply = web_search(parameter or command, original_command=command)
+                if voice_output:
+                    speak(reply)
 
             else:
                 reply = ask_groq(command)

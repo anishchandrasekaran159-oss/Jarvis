@@ -1,24 +1,25 @@
 {
-  "number_of_apps_open": 5,
-  "open_apps": 5,
-  "username": "Anish",
-  "number_of_open_apps": 5,
-  "openApps": [
-    "browser",
-    "email",
-    "chat",
-    "music",
-    "notes"
+  "inspiration": "Tony Stark from Iron Man",
+  "project": "building Jarvis",
+  "interest": "anime",
+  "first_anime_watched": "Death Note",
+  "friends": "recommended an anime",
+  "watched_anime": [
+    "Naruto"
   ],
-  "numberOfOpenApps": 5,
-  "music_preference": "heavy playlist with low bass",
-  "bass_preference": "low",
-  "app_names": [
-    "browser",
-    "email",
-    "chat",
-    "music",
-    "notes"
+  "favourite_animes": [
+    "Death Note",
+    "Naruto",
+    "Attack on Titan",
+    "Tokyo Avengers",
+    "Haikyuu",
+    "Kuroko's Basketball",
+    "Demon Slayer",
+    "Jujutsu Kaisen"
   ],
-  "session_count": 5
+  "completed_animes": "many",
+  "watch_list_anime": "One Piece",
+  "country": "India",
+  "name": "Anish",
+  "favourite_cricketer": "he"
 }
